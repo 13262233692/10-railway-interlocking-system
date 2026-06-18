@@ -12,6 +12,7 @@ import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * 联锁系统控制器
@@ -224,6 +225,26 @@ public class InterlockingController {
         } else {
             return ApiResponse.error(404, "进路不存在");
         }
+    }
+
+    /**
+     * 获取活跃事务状态
+     */
+    @GetMapping("/transactions")
+    public ApiResponse<List<Map<String, Object>>> getTransactionStatus() {
+        log.info("获取事务状态");
+        List<Map<String, Object>> transactions = interlockingService.getTransactionStatus();
+        return ApiResponse.success("获取成功", transactions);
+    }
+
+    /**
+     * 获取资源锁状态
+     */
+    @GetMapping("/resource-locks")
+    public ApiResponse<Map<String, Object>> getResourceLockStatus() {
+        log.info("获取资源锁状态");
+        Map<String, Object> lockStatus = interlockingService.getResourceLockStatus();
+        return ApiResponse.success("获取成功", lockStatus);
     }
 
     /**

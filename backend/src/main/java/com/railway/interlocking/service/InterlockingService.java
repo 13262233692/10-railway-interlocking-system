@@ -7,7 +7,6 @@ import com.railway.interlocking.dto.response.RouteOperationResponse;
 import com.railway.interlocking.model.*;
 import com.railway.interlocking.model.enums.*;
 import com.railway.interlocking.statemachine.InterlockingStateMachine;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
@@ -16,62 +15,36 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
-/**
- * 联锁核心服务
- * Interlocking Core Service
- * 实现铁路联锁系统的核心业务逻辑，包括：
- * 1. 进路锁闭与解锁
- * 2. 道岔控制与联锁
- * 3. 信号机控制
- * 4. 轨道区段状态管理
- * 5. 冲突进路检查与阻断
- */
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class InterlockingService {
 
     private final InterlockingStateMachine stateMachine;
     private final WebSocketService webSocketService;
+    private final ResourceLockManager resourceLockManager;
+    private final TransactionCoordinator transactionCoordinator;
 
-    /**
-     * 车站ID
-     */
     private static final String STATION_ID = "STATION_001";
-
-    /**
-     * 车站名称
-     */
     private static final String STATION_NAME = "高铁南站";
 
-    /**
-     * 轨道区段存储
-     */
     private final Map<String, TrackSection> trackSections = new ConcurrentHashMap<>();
-
-    /**
-     * 道岔存储
-     */
     private final Map<String, Switch> switches = new ConcurrentHashMap<>();
-
-    /**
-     * 信号机存储
-     */
     private final Map<String, Signal> signals = new ConcurrentHashMap<>();
-
-    /**
-     * 进路存储
-     */
     private final Map<String, Route> routes = new ConcurrentHashMap<>();
-
-    /**
-     * 进路锁闭存储
-     */
     private final Map<String, RouteLock> routeLocks = new ConcurrentHashMap<>();
 
-    /**
-     * 初始化站场数据
-     */
+    private final Map<String, String> routeResourceReservations = new ConcurrentHashMap<>();
+
+    public InterlockingService(InterlockingStateMachine stateMachine,
+                                WebSocketService webSocketService,
+                                ResourceLockManager resourceLockManager,
+                                TransactionCoordinator transactionCoordinator) {
+        this.stateMachine = stateMachine;
+        this.webSocketService = webSocketService;
+        this.resourceLockManager = resourceLockManager;
+        this.transactionCoordinator = transactionCoordinator;
+    }
+
     public void initializeStationData(List<TrackSection> sections,
                                        List<Switch> switchesList,
                                        List<Signal> signalsList,
@@ -89,73 +62,136 @@ public class InterlockingService {
         broadcastStatusUpdate();
     }
 
-    /**
-     * 办理进路
-     * 核心联锁逻辑：
-     * 1. 检查进路是否可以办理
-     * 2. 检查所有轨道区段空闲
-     * 3. 检查并转换道岔到正确位置
-     * 4. 锁闭轨道区段和道岔
-     * 5. 阻断所有冲突进路
-     * 6. 锁闭敌对信号机
-     * 7. 开放信号机
-     */
     public RouteOperationResponse establishRoute(RouteEstablishRequest request) {
-        log.info("开始办理进路: routeId={}, operator={}", request.getRouteId(), request.getOperator());
+        String routeId = request.getRouteId();
+        String operator = request.getOperator();
+        log.info("开始办理进路(事务模式): routeId={}, operator={}, thread={}", routeId, operator, Thread.currentThread().getName());
 
-        Route route = routes.get(request.getRouteId());
+        Route route = routes.get(routeId);
         if (route == null) {
-            return createErrorResponse(request.getRouteId(), "办理", "进路不存在", "ROUTE_NOT_FOUND");
+            return createErrorResponse(routeId, "办理", "进路不存在", "ROUTE_NOT_FOUND");
         }
 
         if (!route.canEstablish()) {
-            return createErrorResponse(request.getRouteId(), "办理",
+            return createErrorResponse(routeId, "办理",
                     "进路当前状态不允许办理: " + route.getStatus(), "INVALID_STATUS");
         }
 
+        TransactionCoordinator.TransactionContext txCtx = null;
+
         try {
+            txCtx = transactionCoordinator.beginTransaction(routeId, route.getName(), operator);
+
             stateMachine.transition(route, InterlockingStateMachine.StateEvent.ESTABLISH);
+            transactionCoordinator.pushCompensation(txCtx, () -> {
+                if (route.getStatus() == RouteStatus.LOCKING) {
+                    try {
+                        stateMachine.transition(route, InterlockingStateMachine.StateEvent.UNLOCK);
+                    } catch (Exception e) {
+                        route.setStatus(RouteStatus.NOT_ESTABLISHED);
+                    }
+                }
+                log.info("补偿: 回退进路状态, routeId={}", routeId);
+            });
+
+            List<String> allResourceIds = collectAllResourceIds(route);
+            boolean prepared = transactionCoordinator.prepareResources(txCtx, route, trackSections, switches, signals);
+            if (!prepared) {
+                transactionCoordinator.rollback(txCtx);
+                return createErrorResponse(routeId, "办理",
+                        "资源锁定失败，存在并发冲突，请稍后重试", "RESOURCE_LOCK_CONFLICT");
+            }
 
             List<String> sectionCheckResult = checkSectionsAvailable(route);
             if (!sectionCheckResult.isEmpty()) {
                 String errorMsg = "轨道区段不可用: " + String.join(", ", sectionCheckResult);
-                return createErrorResponse(request.getRouteId(), "办理", errorMsg, "SECTION_NOT_AVAILABLE");
+                transactionCoordinator.rollback(txCtx);
+                handleRouteEstablishFailure(route);
+                return createErrorResponse(routeId, "办理", errorMsg, "SECTION_NOT_AVAILABLE");
             }
 
             List<String> switchCheckResult = checkAndConvertSwitches(route);
             if (!switchCheckResult.isEmpty()) {
                 String errorMsg = "道岔位置不正确且无法转换: " + String.join(", ", switchCheckResult);
-                return createErrorResponse(request.getRouteId(), "办理", errorMsg, "SWITCH_POSITION_ERROR");
+                transactionCoordinator.rollback(txCtx);
+                handleRouteEstablishFailure(route);
+                return createErrorResponse(routeId, "办理", errorMsg, "SWITCH_POSITION_ERROR");
             }
 
             List<String> conflictCheckResult = checkConflictingRoutes(route);
             if (!conflictCheckResult.isEmpty()) {
                 String errorMsg = "冲突进路已办理: " + String.join(", ", conflictCheckResult);
-                return createErrorResponse(request.getRouteId(), "办理", errorMsg, "CONFLICTING_ROUTE");
+                transactionCoordinator.rollback(txCtx);
+                handleRouteEstablishFailure(route);
+                return createErrorResponse(routeId, "办理", errorMsg, "CONFLICTING_ROUTE");
             }
 
-            RouteLock routeLock = createRouteLock(route, request.getOperator());
+            routeResourceReservations.put(routeId, String.join(",", allResourceIds));
+
+            RouteLock routeLock = createRouteLock(route, operator);
+            transactionCoordinator.pushCompensation(txCtx, () -> {
+                routeLock.setActive(false);
+                routeLock.setLockStatus("已回滚");
+                routeLocks.remove(routeLock.getId());
+                log.info("补偿: 移除进路锁闭, routeId={}", routeId);
+            });
 
             lockSections(route, routeLock);
+            transactionCoordinator.pushCompensation(txCtx, () -> {
+                for (String sectionId : route.getSectionIds()) {
+                    TrackSection section = trackSections.get(sectionId);
+                    if (section != null && routeId.equals(section.getLockedByRouteId())) {
+                        section.setStatus(TrackSectionStatus.IDLE);
+                        section.setLockedByRouteId(null);
+                    }
+                }
+                log.info("补偿: 解锁轨道区段, routeId={}", routeId);
+            });
+
             lockSwitches(route, routeLock);
-            blockConflictingRoutes(route, routeLock);
+            transactionCoordinator.pushCompensation(txCtx, () -> {
+                for (String switchId : route.getSwitchIds()) {
+                    Switch sw = switches.get(switchId);
+                    if (sw != null && routeId.equals(sw.getLockedByRouteId())) {
+                        sw.setLocked(false);
+                        sw.setLockedByRouteId(null);
+                    }
+                }
+                log.info("补偿: 解锁道岔, routeId={}", routeId);
+            });
+
             lockHostileSignals(route, routeLock);
+            transactionCoordinator.pushCompensation(txCtx, () -> {
+                for (String signalId : route.getHostileSignalIds()) {
+                    Signal signal = signals.get(signalId);
+                    if (signal != null) {
+                        signal.setLocked(false);
+                    }
+                }
+                log.info("补偿: 解锁敌对信号机, routeId={}", routeId);
+            });
 
             stateMachine.transition(route, InterlockingStateMachine.StateEvent.LOCK);
             route.setLockedTime(LocalDateTime.now());
-            route.setOperator(request.getOperator());
+            route.setOperator(operator);
             route.setGuidanceRoute(request.isGuidanceRoute());
 
             SignalAspect aspect = calculateSignalAspect(route);
             openStartSignal(route, aspect);
+            transactionCoordinator.pushCompensation(txCtx, () -> {
+                closeStartSignal(route);
+                log.info("补偿: 关闭起始信号机, routeId={}", routeId);
+            });
 
             stateMachine.transition(route, InterlockingStateMachine.StateEvent.CLEAR);
             route.setClearedTime(LocalDateTime.now());
 
+            transactionCoordinator.commit(txCtx);
+
             RouteOperationResponse response = createSuccessResponse(route, "办理", routeLock);
             response.setMessage("进路办理成功，信号已开放");
 
-            log.info("进路办理成功: routeId={}, routeName={}", route.getId(), route.getName());
+            log.info("进路办理成功(事务已提交): routeId={}, routeName={}", route.getId(), route.getName());
 
             broadcastRouteUpdate(route, "进路办理成功", "SUCCESS");
             broadcastStatusUpdate();
@@ -163,35 +199,51 @@ public class InterlockingService {
             return response;
 
         } catch (Exception e) {
-            log.error("办理进路异常: routeId={}", request.getRouteId(), e);
+            log.error("办理进路异常(事务将回滚): routeId={}, error={}", routeId, e.getMessage(), e);
+            if (txCtx != null) {
+                transactionCoordinator.rollback(txCtx);
+            }
             handleRouteEstablishFailure(route);
-            return createErrorResponse(request.getRouteId(), "办理",
+            return createErrorResponse(routeId, "办理",
                     "办理进路异常: " + e.getMessage(), "SYSTEM_ERROR");
+        } finally {
+            releaseAllResourceLocks(route);
         }
     }
 
-    /**
-     * 取消进路
-     */
     public RouteOperationResponse cancelRoute(RouteCancelRequest request) {
-        log.info("开始取消进路: routeId={}, operator={}", request.getRouteId(), request.getOperator());
+        String routeId = request.getRouteId();
+        String operator = request.getOperator();
+        log.info("开始取消进路(事务模式): routeId={}, operator={}", routeId, operator);
 
-        Route route = routes.get(request.getRouteId());
+        Route route = routes.get(routeId);
         if (route == null) {
-            return createErrorResponse(request.getRouteId(), "取消", "进路不存在", "ROUTE_NOT_FOUND");
+            return createErrorResponse(routeId, "取消", "进路不存在", "ROUTE_NOT_FOUND");
         }
 
         if (!route.canCancel()) {
-            return createErrorResponse(request.getRouteId(), "取消",
+            return createErrorResponse(routeId, "取消",
                     "进路当前状态不允许取消: " + route.getStatus(), "INVALID_STATUS");
         }
 
         if (route.isApproachLocked() && !request.isForceCancel()) {
-            return createErrorResponse(request.getRouteId(), "取消",
+            return createErrorResponse(routeId, "取消",
                     "进路处于接近锁闭状态，需要强制取消", "APPROACH_LOCKED");
         }
 
+        TransactionCoordinator.TransactionContext txCtx = null;
+
         try {
+            txCtx = transactionCoordinator.beginTransaction(routeId, route.getName(), operator);
+
+            List<String> allResourceIds = collectAllResourceIds(route);
+            boolean prepared = transactionCoordinator.prepareResources(txCtx, route, trackSections, switches, signals);
+            if (!prepared) {
+                transactionCoordinator.rollback(txCtx);
+                return createErrorResponse(routeId, "取消",
+                        "资源锁定失败，存在并发操作，请稍后重试", "RESOURCE_LOCK_CONFLICT");
+            }
+
             stateMachine.transition(route, InterlockingStateMachine.StateEvent.CANCEL);
 
             closeStartSignal(route);
@@ -201,6 +253,10 @@ public class InterlockingService {
                 stateMachine.transition(route, InterlockingStateMachine.StateEvent.UNLOCK);
             }
             route.setUnlockedTime(LocalDateTime.now());
+
+            routeResourceReservations.remove(routeId);
+
+            transactionCoordinator.commit(txCtx);
 
             RouteOperationResponse response = RouteOperationResponse.builder()
                     .routeId(route.getId())
@@ -213,7 +269,7 @@ public class InterlockingService {
                     .operationTime(LocalDateTime.now())
                     .build();
 
-            log.info("进路取消成功: routeId={}, routeName={}", route.getId(), route.getName());
+            log.info("进路取消成功(事务已提交): routeId={}, routeName={}", route.getId(), route.getName());
 
             broadcastRouteUpdate(route, "进路已取消", "INFO");
             broadcastStatusUpdate();
@@ -221,15 +277,17 @@ public class InterlockingService {
             return response;
 
         } catch (Exception e) {
-            log.error("取消进路异常: routeId={}", request.getRouteId(), e);
-            return createErrorResponse(request.getRouteId(), "取消",
+            log.error("取消进路异常(事务将回滚): routeId={}", routeId, e);
+            if (txCtx != null) {
+                transactionCoordinator.rollback(txCtx);
+            }
+            return createErrorResponse(routeId, "取消",
                     "取消进路异常: " + e.getMessage(), "SYSTEM_ERROR");
+        } finally {
+            releaseAllResourceLocks(route);
         }
     }
 
-    /**
-     * 操作道岔
-     */
     public RouteOperationResponse operateSwitch(SwitchOperateRequest request) {
         log.info("开始操作道岔: switchId={}, targetPosition={}, operator={}",
                 request.getSwitchId(), request.getTargetPosition(), request.getOperator());
@@ -291,9 +349,6 @@ public class InterlockingService {
         }
     }
 
-    /**
-     * 控制信号机
-     */
     public RouteOperationResponse controlSignal(SignalControlRequest request) {
         log.info("开始控制信号机: signalId={}, targetAspect={}, operator={}",
                 request.getSignalId(), request.getTargetAspect(), request.getOperator());
@@ -336,9 +391,6 @@ public class InterlockingService {
         }
     }
 
-    /**
-     * 占用轨道区段（模拟列车占用）
-     */
     public RouteOperationResponse occupySection(SectionOccupyRequest request) {
         log.info("开始占用轨道区段: sectionId={}, trainId={}", request.getSectionId(), request.getTrainId());
 
@@ -400,9 +452,6 @@ public class InterlockingService {
         }
     }
 
-    /**
-     * 释放轨道区段（模拟列车出清）
-     */
     public RouteOperationResponse releaseSection(String sectionId, String operator) {
         log.info("开始释放轨道区段: sectionId={}, operator={}", sectionId, operator);
 
@@ -473,9 +522,6 @@ public class InterlockingService {
         }
     }
 
-    /**
-     * 获取联锁系统完整状态
-     */
     public InterlockingStatusResponse getInterlockingStatus() {
         List<TrackSection> sectionList = new ArrayList<>(trackSections.values());
         List<Switch> switchList = new ArrayList<>(switches.values());
@@ -518,9 +564,35 @@ public class InterlockingService {
                 .build();
     }
 
-    /**
-     * 检查轨道区段是否可用（空闲且未锁闭）
-     */
+    public List<Map<String, Object>> getTransactionStatus() {
+        return transactionCoordinator.getActiveTransactionStatus();
+    }
+
+    public Map<String, Object> getResourceLockStatus() {
+        return resourceLockManager.getLockStatus();
+    }
+
+    private List<String> collectAllResourceIds(Route route) {
+        List<String> allResourceIds = new ArrayList<>();
+        allResourceIds.addAll(route.getSectionIds());
+        allResourceIds.addAll(route.getSwitchIds());
+        allResourceIds.add(route.getStartSignalId());
+        if (route.getHostileSignalIds() != null) {
+            allResourceIds.addAll(route.getHostileSignalIds());
+        }
+        return allResourceIds;
+    }
+
+    private void releaseAllResourceLocks(Route route) {
+        try {
+            List<String> allResourceIds = collectAllResourceIds(route);
+            resourceLockManager.unlockAll(allResourceIds, route.getId());
+        } catch (Exception e) {
+            log.error("释放资源锁异常: routeId={}", route.getId(), e);
+            resourceLockManager.unlockHeldLocks(route.getId());
+        }
+    }
+
     private List<String> checkSectionsAvailable(Route route) {
         List<String> unavailableSections = new ArrayList<>();
         for (String sectionId : route.getSectionIds()) {
@@ -534,9 +606,6 @@ public class InterlockingService {
         return unavailableSections;
     }
 
-    /**
-     * 检查并转换道岔位置
-     */
     private List<String> checkAndConvertSwitches(Route route) {
         List<String> failedSwitches = new ArrayList<>();
 
@@ -569,20 +638,16 @@ public class InterlockingService {
         return failedSwitches;
     }
 
-    /**
-     * 检查冲突进路
-     * 不仅检查冲突进路的状态，还检查区段是否被锁闭
-     */
     private List<String> checkConflictingRoutes(Route route) {
         List<String> conflictingRoutes = new ArrayList<>();
-        
+
         for (String conflictingRouteId : route.getConflictingRouteIds()) {
             Route conflictingRoute = routes.get(conflictingRouteId);
             if (conflictingRoute != null && conflictingRoute.isLocked()) {
                 conflictingRoutes.add(conflictingRoute.getName() + "(" + conflictingRoute.getStatus() + ")");
             }
         }
-        
+
         for (String sectionId : route.getSectionIds()) {
             TrackSection section = trackSections.get(sectionId);
             if (section != null && section.isLocked()) {
@@ -598,13 +663,10 @@ public class InterlockingService {
                 }
             }
         }
-        
+
         return conflictingRoutes;
     }
 
-    /**
-     * 检查道岔是否被进路阻挡
-     */
     private List<String> checkSwitchBlockingRoutes(Switch sw) {
         List<String> blockingRoutes = new ArrayList<>();
         for (Route route : routes.values()) {
@@ -615,9 +677,6 @@ public class InterlockingService {
         return blockingRoutes;
     }
 
-    /**
-     * 创建进路锁闭记录
-     */
     private RouteLock createRouteLock(Route route, String operator) {
         RouteLock routeLock = RouteLock.builder()
                 .id("LOCK_" + route.getId() + "_" + System.currentTimeMillis())
@@ -646,9 +705,6 @@ public class InterlockingService {
         return routeLock;
     }
 
-    /**
-     * 锁闭轨道区段
-     */
     private void lockSections(Route route, RouteLock routeLock) {
         for (String sectionId : route.getSectionIds()) {
             TrackSection section = trackSections.get(sectionId);
@@ -660,9 +716,6 @@ public class InterlockingService {
         }
     }
 
-    /**
-     * 锁闭道岔
-     */
     private void lockSwitches(Route route, RouteLock routeLock) {
         for (String switchId : route.getSwitchIds()) {
             Switch sw = switches.get(switchId);
@@ -674,21 +727,6 @@ public class InterlockingService {
         }
     }
 
-    /**
-     * 阻断冲突进路
-     */
-    private void blockConflictingRoutes(Route route, RouteLock routeLock) {
-        for (String conflictingRouteId : route.getConflictingRouteIds()) {
-            Route conflictingRoute = routes.get(conflictingRouteId);
-            if (conflictingRoute != null) {
-                log.debug("冲突进路已被阻断: {} -> {}", route.getName(), conflictingRoute.getName());
-            }
-        }
-    }
-
-    /**
-     * 锁闭敌对信号机
-     */
     private void lockHostileSignals(Route route, RouteLock routeLock) {
         for (String signalId : route.getHostileSignalIds()) {
             Signal signal = signals.get(signalId);
@@ -703,9 +741,6 @@ public class InterlockingService {
         }
     }
 
-    /**
-     * 计算信号机显示
-     */
     private SignalAspect calculateSignalAspect(Route route) {
         if (route.isGuidanceRoute()) {
             return SignalAspect.DOUBLE_YELLOW;
@@ -725,9 +760,6 @@ public class InterlockingService {
         }
     }
 
-    /**
-     * 计算前方空闲闭塞分区数量
-     */
     private int countFreeBlocksAhead(Route route) {
         int freeCount = 0;
         for (String sectionId : route.getSectionIds()) {
@@ -739,9 +771,6 @@ public class InterlockingService {
         return freeCount;
     }
 
-    /**
-     * 开放起始信号机
-     */
     private void openStartSignal(Route route, SignalAspect aspect) {
         Signal startSignal = signals.get(route.getStartSignalId());
         if (startSignal != null) {
@@ -751,9 +780,6 @@ public class InterlockingService {
         }
     }
 
-    /**
-     * 关闭起始信号机
-     */
     private void closeStartSignal(Route route) {
         Signal startSignal = signals.get(route.getStartSignalId());
         if (startSignal != null) {
@@ -763,9 +789,6 @@ public class InterlockingService {
         }
     }
 
-    /**
-     * 解锁进路
-     */
     private void unlockRoute(Route route, String reason, String operator) {
         RouteLock routeLock = findActiveRouteLock(route.getId());
         if (routeLock != null) {
@@ -810,9 +833,6 @@ public class InterlockingService {
         route.setOccupiedByTrainId(null);
     }
 
-    /**
-     * 自动解锁进路（列车出清后）
-     */
     private void autoUnlockRoute(Route route, String trainId) {
         if (!route.isAutoUnlock()) {
             log.info("进路[{}]不支持自动解锁，需人工操作", route.getName());
@@ -825,6 +845,8 @@ public class InterlockingService {
             stateMachine.transition(route, InterlockingStateMachine.StateEvent.UNLOCK);
             route.setUnlockedTime(LocalDateTime.now());
 
+            routeResourceReservations.remove(route.getId());
+
             log.info("进路自动解锁成功: routeId={}, trainId={}", route.getId(), trainId);
 
             broadcastRouteUpdate(route, "进路已自动解锁", "INFO");
@@ -833,18 +855,15 @@ public class InterlockingService {
         }
     }
 
-    /**
-     * 处理进路办理失败
-     */
     private void handleRouteEstablishFailure(Route route) {
         try {
-            if (route.getStatus() == RouteStatus.LOCKING 
+            if (route.getStatus() == RouteStatus.LOCKING
                     || route.getStatus() == RouteStatus.LOCKED
                     || route.getStatus() == RouteStatus.CLEARED) {
                 unlockRoute(route, "办理失败回滚", "SYSTEM");
                 if (route.getStatus() == RouteStatus.LOCKING) {
                     stateMachine.transition(route, InterlockingStateMachine.StateEvent.UNLOCK);
-                } else if (route.getStatus() == RouteStatus.LOCKED 
+                } else if (route.getStatus() == RouteStatus.LOCKED
                         || route.getStatus() == RouteStatus.CLEARED) {
                     stateMachine.transition(route, InterlockingStateMachine.StateEvent.CANCEL);
                     stateMachine.transition(route, InterlockingStateMachine.StateEvent.UNLOCK);
@@ -854,41 +873,29 @@ public class InterlockingService {
             log.error("回滚进路状态异常: routeId={}", route.getId(), e);
             try {
                 route.setStatus(RouteStatus.NOT_ESTABLISHED);
-                route.setStatusRemark("强制重置为未建立状态");
+                route.setStatusRemark("强制重置为未建立状态(事务回滚兜底)");
             } catch (Exception ex) {
                 log.error("强制重置进路状态失败: routeId={}", route.getId(), ex);
             }
         }
     }
 
-    /**
-     * 查找包含指定区段的进路
-     */
     private List<Route> findRoutesContainingSection(String sectionId) {
         return routes.values().stream()
                 .filter(route -> route.getSectionIds().contains(sectionId))
                 .collect(Collectors.toList());
     }
 
-    /**
-     * 检查是否为进路的第一个区段
-     */
     private boolean isFirstSectionOfRoute(Route route, String sectionId) {
         return !route.getSectionIds().isEmpty()
                 && route.getSectionIds().get(0).equals(sectionId);
     }
 
-    /**
-     * 检查是否为进路的最后一个区段
-     */
     private boolean isLastSectionOfRoute(Route route, String sectionId) {
         List<String> sections = route.getSectionIds();
         return !sections.isEmpty() && sections.get(sections.size() - 1).equals(sectionId);
     }
 
-    /**
-     * 检查进路的所有区段是否都已释放（未占用）
-     */
     private boolean areAllSectionsOfRouteReleased(Route route) {
         for (String sectionId : route.getSectionIds()) {
             TrackSection section = trackSections.get(sectionId);
@@ -899,9 +906,6 @@ public class InterlockingService {
         return true;
     }
 
-    /**
-     * 检查并解锁列车已经通过的区段
-     */
     private void checkAndUnlockPassedSections(String trainId) {
         for (Route route : routes.values()) {
             if (!route.isOccupied() || !trainId.equals(route.getOccupiedByTrainId())) {
@@ -932,9 +936,6 @@ public class InterlockingService {
         }
     }
 
-    /**
-     * 查找激活的进路锁闭
-     */
     private RouteLock findActiveRouteLock(String routeId) {
         return routeLocks.values().stream()
                 .filter(lock -> routeId.equals(lock.getRouteId()) && lock.isActive())
@@ -942,9 +943,6 @@ public class InterlockingService {
                 .orElse(null);
     }
 
-    /**
-     * 创建成功响应
-     */
     private RouteOperationResponse createSuccessResponse(Route route, String operationType, RouteLock routeLock) {
         return RouteOperationResponse.builder()
                 .routeId(route.getId())
@@ -961,9 +959,6 @@ public class InterlockingService {
                 .build();
     }
 
-    /**
-     * 创建错误响应
-     */
     private RouteOperationResponse createErrorResponse(String id, String operationType,
                                                        String message, String errorCode) {
         return RouteOperationResponse.builder()
@@ -977,9 +972,6 @@ public class InterlockingService {
                 .build();
     }
 
-    /**
-     * 广播状态更新
-     */
     private void broadcastStatusUpdate() {
         try {
             InterlockingStatusResponse status = getInterlockingStatus();
@@ -991,9 +983,6 @@ public class InterlockingService {
         }
     }
 
-    /**
-     * 广播进路更新
-     */
     private void broadcastRouteUpdate(Route route, String content, String level) {
         try {
             WebSocketMessage<Route> message = WebSocketMessage.routeUpdate(
@@ -1005,9 +994,6 @@ public class InterlockingService {
         }
     }
 
-    /**
-     * 广播道岔更新
-     */
     private void broadcastSwitchUpdate(Switch sw) {
         try {
             WebSocketMessage<Switch> message = WebSocketMessage.<Switch>builder()
@@ -1025,9 +1011,6 @@ public class InterlockingService {
         }
     }
 
-    /**
-     * 广播信号机更新
-     */
     private void broadcastSignalUpdate(Signal signal) {
         try {
             WebSocketMessage<Signal> message = WebSocketMessage.<Signal>builder()
@@ -1045,9 +1028,6 @@ public class InterlockingService {
         }
     }
 
-    /**
-     * 广播区段更新
-     */
     private void broadcastSectionUpdate(TrackSection section) {
         try {
             WebSocketMessage<TrackSection> message = WebSocketMessage.<TrackSection>builder()
@@ -1065,58 +1045,34 @@ public class InterlockingService {
         }
     }
 
-    /**
-     * 获取所有轨道区段
-     */
     public List<TrackSection> getAllTrackSections() {
         return new ArrayList<>(trackSections.values());
     }
 
-    /**
-     * 获取所有道岔
-     */
     public List<Switch> getAllSwitches() {
         return new ArrayList<>(switches.values());
     }
 
-    /**
-     * 获取所有信号机
-     */
     public List<Signal> getAllSignals() {
         return new ArrayList<>(signals.values());
     }
 
-    /**
-     * 获取所有进路
-     */
     public List<Route> getAllRoutes() {
         return new ArrayList<>(routes.values());
     }
 
-    /**
-     * 获取单个轨道区段
-     */
     public TrackSection getTrackSection(String id) {
         return trackSections.get(id);
     }
 
-    /**
-     * 获取单个道岔
-     */
     public Switch getSwitch(String id) {
         return switches.get(id);
     }
 
-    /**
-     * 获取单个信号机
-     */
     public Signal getSignal(String id) {
         return signals.get(id);
     }
 
-    /**
-     * 获取单个进路
-     */
     public Route getRoute(String id) {
         return routes.get(id);
     }
